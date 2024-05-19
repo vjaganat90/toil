@@ -16,7 +16,7 @@ def mkdtemp(suffix: Optional[str] = None, prefix: Optional[str] = None, dir: Opt
 
     The permissions on the directory will be 711 instead of 700, allowing the
     group and all other users to traverse the directory. This is necessary if
-    the direcotry is on NFS and the Docker daemon would like to mount it or a
+    the directory is on NFS and the Docker daemon would like to mount it or a
     file inside it into a container, because on NFS even the Docker daemon
     appears bound by the file permissions.
 
@@ -159,14 +159,26 @@ def atomic_copyobj(src_fh: BytesIO, dest_path: str, length: int = 16384, executa
             os.chmod(dest_path_tmp, os.stat(dest_path_tmp).st_mode | stat.S_IXUSR)
 
 
-def make_public_dir(in_directory: Optional[str] = None) -> str:
+def make_public_dir(in_directory: str, suggested_name: Optional[str] = None) -> str:
     """
+    Make a publicly-accessible directory in the given directory.
+
+    :param suggested_name: Use this directory name first if possible.
+
     Try to make a random directory name with length 4 that doesn't exist, with the given prefix.
     Otherwise, try length 5, length 6, etc, up to a max of 32 (len of uuid4 with dashes replaced).
     This function's purpose is mostly to avoid having long file names when generating directories.
     If somehow this fails, which should be incredibly unlikely, default to a normal uuid4, which was
     our old default.
     """
+    if suggested_name is not None:
+        generated_dir_path: str = os.path.join(in_directory, suggested_name)
+        try:
+            os.mkdir(generated_dir_path)
+            os.chmod(generated_dir_path, 0o777)
+            return generated_dir_path
+        except FileExistsError:
+            pass
     for i in range(4, 32 + 1):  # make random uuids and truncate to lengths starting at 4 and working up to max 32
         for _ in range(10):  # make 10 attempts for each length
             truncated_uuid: str = str(uuid.uuid4()).replace('-', '')[:i]

@@ -51,7 +51,7 @@ from toil.lib.aws.iam import (CLUSTER_LAUNCHING_PERMISSIONS,
                               get_policy_permissions,
                               policy_permissions_allow)
 from toil.lib.aws.session import AWSConnectionManager
-from toil.lib.aws.utils import create_s3_bucket, flatten_tags
+from toil.lib.aws.utils import create_s3_bucket, flatten_tags, boto3_pager
 from toil.lib.conversions import human2bytes
 from toil.lib.ec2 import (a_short_time,
                           create_auto_scaling_group,
@@ -88,6 +88,7 @@ from mypy_boto3_ec2.client import EC2Client
 from mypy_boto3_iam.client import IAMClient
 from mypy_boto3_ec2.type_defs import DescribeInstancesResultTypeDef, InstanceTypeDef, TagTypeDef, BlockDeviceMappingTypeDef, EbsBlockDeviceTypeDef, FilterTypeDef, SpotInstanceRequestTypeDef, TagDescriptionTypeDef, SecurityGroupTypeDef, \
     CreateSecurityGroupResultTypeDef, IpPermissionTypeDef, ReservationTypeDef
+from mypy_boto3_s3.literals import BucketLocationConstraintType
 
 logger = logging.getLogger(__name__)
 logging.getLogger("boto").setLevel(logging.CRITICAL)
@@ -194,7 +195,8 @@ def collapse_tags(instance_tags: List[TagTypeDef]) -> Dict[str, str]:
 
 class AWSProvisioner(AbstractProvisioner):
     def __init__(self, clusterName: Optional[str], clusterType: Optional[str], zone: Optional[str],
-                 nodeStorage: int, nodeStorageOverrides: Optional[List[str]], sseKey: Optional[str]):
+                 nodeStorage: int, nodeStorageOverrides: Optional[List[str]], sseKey: Optional[str],
+                 enable_fuse: bool):
         self.cloud = 'aws'
         self._sseKey = sseKey
         # self._zone will be filled in by base class constructor
@@ -220,8 +222,12 @@ class AWSProvisioner(AbstractProvisioner):
 
         # Call base class constructor, which will call createClusterSettings()
         # or readClusterSettings()
-        super().__init__(clusterName, clusterType, zone, nodeStorage, nodeStorageOverrides)
-        self._leader_subnet: str = self._get_default_subnet(self._zone)
+        super().__init__(clusterName, clusterType, zone, nodeStorage, nodeStorageOverrides, enable_fuse)
+
+        if self._zone is None:
+            logger.warning("Leader zone was never initialized before creating AWS provisioner. Defaulting to cluster zone.")
+
+        self._leader_subnet: str = self._get_default_subnet(self._zone or zone)
         self._tags: Dict[str, Any] = {}
 
         # After self.clusterName is set, generate a valid name for the S3 bucket associated with this cluster
@@ -566,7 +572,7 @@ class AWSProvisioner(AbstractProvisioner):
         }]
 
         # TODO: Can't we use the resource's network_acls.filter(Filters=)?
-        return [item['NetworkAclId'] for item in self._pager(ec2.describe_network_acls,
+        return [item['NetworkAclId'] for item in boto3_pager(ec2.describe_network_acls,
                                                              'NetworkAcls',
                                                              Filters=filters)]
 
@@ -618,7 +624,7 @@ class AWSProvisioner(AbstractProvisioner):
 
         return 'aws'
 
-    def getNodeShape(self, instance_type: str, preemptible: bool = False) -> Shape:
+    def getNodeShape(self, instance_type: str, preemptible: bool=False) -> Shape:
         """
         Get the Shape for the given instance type (e.g. 't2.medium').
         """
@@ -812,7 +818,7 @@ class AWSProvisioner(AbstractProvisioner):
 
         return spot_bid
 
-    def addNodes(self, nodeTypes: Set[str], numNodes: int, preemptible: bool, spotBid: Optional[float] = None) -> int:
+    def addNodes(self, nodeTypes: Set[str], numNodes: int, preemptible: bool, spotBid: Optional[float]=None) -> int:
         # Grab the AWS connection we need
         boto3_ec2 = get_client(service_name='ec2', region_name=self._region)
         assert self._leaderPrivateIP
@@ -1258,7 +1264,6 @@ class AWSProvisioner(AbstractProvisioner):
         """
         Create security groups for the cluster. Returns a list of their IDs.
         """
-
         def group_not_found(e: ClientError) -> bool:
             retry = (get_error_status(e) == 400 and 'does not exist in default VPC' in get_error_body(e))
             return retry
@@ -1594,27 +1599,6 @@ class AWSProvisioner(AbstractProvisioner):
             else:
                 break
 
-    def _pager(self, requestor_callable: Callable[..., Any], result_attribute_name: str,
-               **kwargs: Any) -> Iterable[Any]:
-        """
-        Yield all the results from calling the given Boto 3 method with the
-        given keyword arguments, paging through the results using the Marker or
-        NextToken, and fetching out and looping over the list in the response
-        with the given attribute name.
-        """
-
-        # Recover the Boto3 client, and the name of the operation
-        client = requestor_callable.__self__  # type: ignore[attr-defined]
-        op_name = requestor_callable.__name__
-
-        # grab a Boto 3 built-in paginator. See
-        # <https://boto3.amazonaws.com/v1/documentation/api/latest/guide/paginators.html>
-        paginator = client.get_paginator(op_name)
-
-        for page in paginator.paginate(**kwargs):
-            # Invoke it and go through the pages, yielding from them
-            yield from page.get(result_attribute_name, [])
-
     @awsRetry
     def _getRoleNames(self) -> List[str]:
         """
@@ -1623,7 +1607,7 @@ class AWSProvisioner(AbstractProvisioner):
 
         results = []
         boto3_iam = self.aws.client(self._region, 'iam')
-        for result in self._pager(boto3_iam.list_roles, 'Roles'):
+        for result in boto3_pager(boto3_iam.list_roles, 'Roles'):
             # For each Boto2 role object
             # Grab out the name
             cast(RoleTypeDef, result)
@@ -1641,10 +1625,10 @@ class AWSProvisioner(AbstractProvisioner):
 
         results = []
         boto3_iam = self.aws.client(self._region, 'iam')
-        for result in self._pager(boto3_iam.list_instance_profiles,
+        for result in boto3_pager(boto3_iam.list_instance_profiles,
                                   'InstanceProfiles'):
-            # For each Boto role object
             # Grab out the name
+            cast(InstanceProfileTypeDef, result)
             name = result['InstanceProfileName']
             if self._is_our_namespaced_name(name):
                 # If it looks like ours, it is ours.
@@ -1662,7 +1646,7 @@ class AWSProvisioner(AbstractProvisioner):
         # Grab the connection we need to use for this operation.
         boto3_iam: IAMClient = self.aws.client(self._region, 'iam')
 
-        return [item['InstanceProfileName'] for item in self._pager(boto3_iam.list_instance_profiles_for_role,
+        return [item['InstanceProfileName'] for item in boto3_pager(boto3_iam.list_instance_profiles_for_role,
                                                                     'InstanceProfiles',
                                                                     RoleName=role_name)]
 
@@ -1681,7 +1665,7 @@ class AWSProvisioner(AbstractProvisioner):
 
         # TODO: we don't currently use attached policies.
 
-        return [item['PolicyArn'] for item in self._pager(boto3_iam.list_attached_role_policies,
+        return [item['PolicyArn'] for item in boto3_pager(boto3_iam.list_attached_role_policies,
                                                           'AttachedPolicies',
                                                           RoleName=role_name)]
 
@@ -1695,7 +1679,7 @@ class AWSProvisioner(AbstractProvisioner):
         # Grab the connection we need to use for this operation.
         boto3_iam: IAMClient = self.aws.client(self._region, 'iam')
 
-        return list(self._pager(boto3_iam.list_role_policies, 'PolicyNames', RoleName=role_name))
+        return list(boto3_pager(boto3_iam.list_role_policies, 'PolicyNames', RoleName=role_name))
 
     def full_policy(self, resource: str) -> Dict[str, Any]:
         """

@@ -122,6 +122,7 @@ class Config:
     kubernetes_owner: Optional[str]
     kubernetes_service_account: Optional[str]
     kubernetes_pod_timeout: float
+    kubernetes_privileged: bool
     tes_endpoint: str
     tes_user: str
     tes_password: str
@@ -208,6 +209,7 @@ class Config:
     doubleMem: bool
     maxJobDuration: int
     rescueJobsFrequency: int
+    job_store_timeout: float
 
     # Log management
     maxLogFileSize: int
@@ -373,6 +375,7 @@ class Config:
         set_option("doubleMem")
         set_option("maxJobDuration")
         set_option("rescueJobsFrequency")
+        set_option("job_store_timeout")
 
         # Log management
         set_option("maxLogFileSize")
@@ -410,8 +413,6 @@ class Config:
             self.workDir = os.getenv('TOIL_COORDINATION_DIR_OVERRIDE')
 
         self.check_configuration_consistency()
-
-        logger.debug("Loaded configuration: %s", vars(options))
 
     def check_configuration_consistency(self) -> None:
         """Old checks that cannot be fit into an action class for argparse"""
@@ -600,7 +601,10 @@ def generate_config(filepath: str) -> None:
 
 
 def parser_with_common_options(
-        provisioner_options: bool = False, jobstore_option: bool = True, prog: Optional[str] = None
+    provisioner_options: bool = False,
+    jobstore_option: bool = True,
+    prog: Optional[str] = None,
+    default_log_level: Optional[int] = None
 ) -> ArgParser:
     parser = ArgParser(prog=prog or "Toil", formatter_class=ArgumentDefaultsHelpFormatter)
 
@@ -611,7 +615,7 @@ def parser_with_common_options(
         parser.add_argument('jobStore', type=str, help=JOBSTORE_HELP)
 
     # always add these
-    add_logging_options(parser)
+    add_logging_options(parser, default_log_level)
     parser.add_argument("--version", action='version', version=version)
     parser.add_argument("--tempDirRoot", dest="tempDirRoot", type=str, default=tempfile.gettempdir(),
                         help="Path to where temporary directory containing all temp files are created, "
@@ -709,7 +713,7 @@ def addOptions(parser: ArgumentParser, jobstore_as_flag: bool = False, cwl: bool
                             help="WDL document URI")
         parser.add_argument("inputs_uri", type=str, nargs='?',
                             help="WDL input JSON URI")
-        parser.add_argument("--input", "-i", dest="inputs_uri", type=str,
+        parser.add_argument("--input", "--inputs", "-i", dest="inputs_uri", type=str,
                             help="WDL input JSON URI")
         check_arguments(typ="wdl")
 
@@ -717,7 +721,7 @@ def addOptions(parser: ArgumentParser, jobstore_as_flag: bool = False, cwl: bool
 @lru_cache(maxsize=None)
 def getNodeID() -> str:
     """
-    Return unique ID of the current node (host). The resulting string will be convertable to a uuid.UUID.
+    Return unique ID of the current node (host). The resulting string will be convertible to a uuid.UUID.
 
     Tries several methods until success. The returned ID should be identical across calls from different processes on
     the same node at least until the next OS reboot.
@@ -765,7 +769,7 @@ def getNodeID() -> str:
                        "experience cryptic job failures")
     if len(nodeID.replace('-', '')) < UUID_LENGTH:
         # Some platforms (Mac) give us not enough actual hex characters.
-        # Repeat them so the result is convertable to a uuid.UUID
+        # Repeat them so the result is convertible to a uuid.UUID
         nodeID = nodeID.replace('-', '')
         num_repeats = UUID_LENGTH // len(nodeID) + 1
         nodeID = nodeID * num_repeats
@@ -809,6 +813,7 @@ class Toil(ContextManager["Toil"]):
         set_logging_from_options(self.options)
         config = Config()
         config.setOptions(self.options)
+        logger.debug("Loaded configuration: %s", vars(self.options))
         if config.jobStore is None:
             raise RuntimeError("No jobstore provided!")
         jobStore = self.getJobStore(config.jobStore)
@@ -1301,6 +1306,9 @@ class Toil(ContextManager["Toil"]):
                     os.path.join(os.environ['XDG_RUNTIME_DIR'], 'toil'))) or
                 # Try under /run/lock. It might be a temp dir style sticky directory.
                 try_path('/run/lock') or
+                # Before trying the workdir, try the /tmp directory as tmp directories
+                # should be local to the node and not shared like a work directoy might be
+                try_path('/tmp/toil_coordination') or
                 # Finally, fall back on the work dir and hope it's a legit filesystem.
                 cls.getToilWorkDir(config_work_dir)
         )

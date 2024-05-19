@@ -16,11 +16,12 @@ from toil.test import (ToilTest,
                        needs_docker_cuda,
                        needs_google_storage,
                        needs_singularity_or_docker,
+                       needs_wdl,
                        slow, integrative)
 from toil.version import exactPython
 from toil.wdl.wdltoil import WDLSectionJob, WDLWorkflowGraph
 
-
+@needs_wdl
 class BaseWDLTest(ToilTest):
     """Base test class for WDL tests."""
 
@@ -44,7 +45,7 @@ class WDLConformanceTests(BaseWDLTest):
     def setUpClass(cls) -> None:
 
         url = "https://github.com/DataBiosphere/wdl-conformance-tests.git"
-        commit = "032fb99a1458d456b6d5f17d27928469ec1a1c68"
+        commit = "c87b62b4f460e009fd42edec13669c4db14cf90c"
 
         p = subprocess.Popen(
             f"git clone {url} {cls.wdl_dir} && cd {cls.wdl_dir} && git checkout {commit}",
@@ -63,7 +64,7 @@ class WDLConformanceTests(BaseWDLTest):
     # estimated running time: 2 minutes
     @slow
     def test_conformance_tests_v10(self):
-        tests_to_run = "0,1,5-7,9-15,17,22-24,26,28-30,32-40,53,57-59,62,67-69"
+        tests_to_run = "0-15,17-20,22-71,73-77"
         p = subprocess.run(self.base_command + ["-v", "1.0", "-n", tests_to_run], capture_output=True)
 
         if p.returncode != 0:
@@ -74,9 +75,19 @@ class WDLConformanceTests(BaseWDLTest):
     # estimated running time: 2 minutes
     @slow
     def test_conformance_tests_v11(self):
-        tests_to_run = "2-11,13-15,17-20,22-24,26,29,30,32-40,53,57-59,62,67-69"
+        tests_to_run = "1-63,65-71,73-75,77"
         p = subprocess.run(self.base_command + ["-v", "1.1", "-n", tests_to_run], capture_output=True)
 
+        if p.returncode != 0:
+            print(p.stdout.decode('utf-8', errors='replace'))
+
+        p.check_returncode()
+
+    @slow
+    def test_conformance_tests_integration(self):
+        ids_to_run = "encode,tut01,tut02,tut03,tut04"
+        p = subprocess.run(self.base_command + ["-v", "1.0", "--id", ids_to_run], capture_output=True)
+        
         if p.returncode != 0:
             print(p.stdout.decode('utf-8', errors='replace'))
 
@@ -148,7 +159,7 @@ class WDLTests(BaseWDLTest):
         assert isinstance(outputs['hello_caller.message_files'], list)
         assert len(outputs['hello_caller.message_files']) == 2
         for item in outputs['hello_caller.message_files']:
-            # All the files should be strings in the "out" direcotry
+            # All the files should be strings in the "out" directory
             assert isinstance(item, str)
             assert item.startswith(out_dir)
 

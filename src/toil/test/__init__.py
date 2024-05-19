@@ -36,6 +36,7 @@ from typing import (Any,
                     Dict,
                     Generator,
                     List,
+                    Literal,
                     Optional,
                     Tuple,
                     Type,
@@ -46,12 +47,11 @@ from unittest.util import strclass
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-import pytz
 
-if sys.version_info >= (3, 8):
-    from typing import Literal
+if sys.version_info >= (3, 9):
+    import zoneinfo
 else:
-    from typing_extensions import Literal
+    from backports import zoneinfo
 
 from toil import ApplianceImageNotFound, applianceSelf, toilPackageDirPath
 from toil.lib.accelerators import (have_working_nvidia_docker_runtime,
@@ -85,8 +85,8 @@ class ToilTest(unittest.TestCase):
     _tempDirs: List[str] = []
 
     def setup_method(self, method: Any) -> None:
-        western = pytz.timezone('America/Los_Angeles')
-        california_time = western.localize(datetime.datetime.now())
+        western = zoneinfo.ZoneInfo("America/Los_Angeles")
+        california_time = datetime.datetime.now(tz=western)
         timestamp = california_time.strftime("%b %d %Y %H:%M:%S:%f %Z")
         print(f"\n\n[TEST] {strclass(self.__class__)}:{self._testMethodName} ({timestamp})\n\n")
 
@@ -372,14 +372,15 @@ def needs_aws_s3(test_item: MT) -> MT:
     # TODO: we just check for generic access to the AWS account
     test_item = _mark_test('aws-s3', needs_online(test_item))
     try:
-        from boto import config
-        boto_credentials = config.get('Credentials', 'aws_access_key_id')
+        from boto3 import Session
+        session = Session()
+        boto3_credentials = session.get_credentials()
     except ImportError:
         return unittest.skip("Install Toil with the 'aws' extra to include this test.")(
             test_item
         )
     from toil.lib.aws import running_on_ec2
-    if not (boto_credentials or os.path.exists(os.path.expanduser('~/.aws/credentials')) or running_on_ec2()):
+    if not (boto3_credentials or os.path.exists(os.path.expanduser('~/.aws/credentials')) or running_on_ec2()):
         return unittest.skip("Configure AWS credentials to include this test.")(test_item)
     return test_item
 
@@ -632,6 +633,20 @@ def needs_cwl(test_item: MT) -> MT:
     else:
         return test_item
 
+def needs_wdl(test_item: MT) -> MT:
+    """
+    Use as a decorator before test classes or methods to only run them if miniwdl is installed
+    and configured.
+    """
+    test_item = _mark_test('wdl', test_item)
+    try:
+        # noinspection PyUnresolvedReferences
+        import WDL  # noqa
+    except ImportError:
+        return unittest.skip("Install Toil with the 'wdl' extra to include this test.")(test_item)
+    else:
+        return test_item
+
 
 def needs_server(test_item: MT) -> MT:
     """
@@ -747,7 +762,7 @@ def integrative(test_item: MT) -> MT:
         return test_item
     else:
         return unittest.skip(
-            'Set TOIL_TEST_INTEGRATIVE="True" to include this integration test, '
+            'Set TOIL_TEST_INTEGRATIVE=True to include this integration test, '
             "or run `make integration_test_local` to run all integration tests."
         )(test_item)
 

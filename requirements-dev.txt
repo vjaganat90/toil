@@ -4,17 +4,21 @@ pytest-timeout>=1.4.2,<3
 stubserver>=1.1,<2
 setuptools>=65.5.1,<70
 sphinx>=7,<8
-sphinx-autoapi>=2.1.1,<3
-# astroid 3 won't work until some sphinx-autoapi release after 2.1.1
-astroid>=2.15,<3
+sphinx-autoapi>=3,<4
+astroid>=3,<4
 sphinx-autodoc-typehints>=1.24.0,<3
 sphinxcontrib-autoprogram==0.1.9
 cwltest>=2.2.20211116163652
-mypy==1.9.0
-types-requests
-types-setuptools
+mypy==1.10.0
+types-aws-xray-sdk
 types-boto<2.49.18.20240205
-types-pytz
+types-Flask-Cors
+types-requests
+types-psutil
+types-python-dateutil
+types-setuptools
+types-xmltodict
+backports.zoneinfo[tzdata];python_version<"3.9"
 flake8>=3.8.4,<8
 flake8-bugbear>=20.11.1,<25
 black
@@ -27,3 +31,4 @@ lxml
 docutils>=0.16,<0.22
 pyupgrade
 pytest-xdist
+build

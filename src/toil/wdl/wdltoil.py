@@ -50,7 +50,7 @@ import WDL.Error
 import WDL.runtime.config
 from configargparse import ArgParser
 from WDL._util import byte_size_units, strip_leading_whitespace
-from WDL.CLI import print_error
+from WDL.CLI import print_error, runner_exe
 from WDL.runtime.backend.docker_swarm import SwarmContainer
 from WDL.runtime.backend.singularity import SingularityContainer
 from WDL.runtime.task_container import TaskContainer
@@ -69,6 +69,7 @@ from toil.job import (AcceleratorRequirement,
                       unwrap_all)
 from toil.jobStores.abstractJobStore import (AbstractJobStore, UnimplementedURLException,
                                              InvalidImportExportUrlException, LocatorException)
+from toil.lib.accelerators import count_nvidia_gpus, get_individual_local_accelerators
 from toil.lib.conversions import convert_units, human2bytes, strtobool
 from toil.lib.io import mkdtemp
 from toil.lib.memoize import memoize
@@ -142,6 +143,185 @@ def report_wdl_errors(task: str, exit: bool = False, log: Callable[[str], None] 
         return cast(F, decorated)
     return decorator
 
+def remove_common_leading_whitespace(expression: WDL.Expr.String, tolerate_blanks: bool = True, tolerate_dedents: bool = False, tolerate_all_whitespace: bool = True, debug: bool = False) -> WDL.Expr.String:
+    """
+    Remove "common leading whitespace" as defined in the WDL 1.1 spec.
+
+    See <https://github.com/openwdl/wdl/blob/main/versions/1.1/SPEC.md#stripping-leading-whitespace>.
+
+    Operates on a WDL.Expr.String expression that has already been parsed.
+
+    :param tolerate_blanks: If True, don't allow totally blank lines to zero
+        the common whitespace.
+
+    :param tolerate_dedents: If True, remove as much of the whitespace on the
+        first indented line as is found on subesquent lines, regardless of
+        whether later lines are out-dented relative to it.
+
+    :param tolerate_all_whitespace: If True, don't allow all-whitespace lines
+        to reduce the common whitespace prefix.
+
+    :param debug: If True, the function will show its work by logging at debug
+        level. 
+    """
+
+    # The expression has a "parts" list consisting of interleaved string
+    # literals and placeholder expressions.
+    #
+    # TODO: We assume that there are no newlines in the placeholders.
+    #
+    # TODO: Look at the placeholders and their line and end_line values and try
+    # and guess if they should reduce the amount of common whitespace.
+
+    if debug:
+        logger.debug("Parts: %s", expression.parts)
+
+    # We split the parts list into lines, which are also interleaved string
+    # literals and placeholder expressions.
+    lines: List[List[Union[str, WDL.Expr.Placeholder]]] = [[]]
+    for part in expression.parts:
+        if isinstance(part, str):
+            # It's a string. Split it into lines.
+            part_lines = part.split("\n")
+            # Part before any newline goes at the end of the current line
+            lines[-1].append(part_lines[0])
+            for part_line in part_lines[1:]:
+                # Any part after a newline starts a new line
+                lines.append([part_line])
+        else:
+            # It's a placeholder. Put it at the end of the current line.
+            lines[-1].append(part)
+
+    if debug:
+        logger.debug("Lines: %s", lines)
+
+    # Then we compute the common amount of leading whitespace on all the lines,
+    # looking at the first string literal.
+    # This will be the longest common whitespace prefix, or None if not yet detected.
+    common_whitespace_prefix: Optional[str] = None
+    for line in lines:
+        if len(line) == 0:
+            # TODO: how should totally empty lines be handled? Not in the spec!
+            if not tolerate_blanks:
+                # There's no leading whitespace here!
+                common_whitespace_prefix = ""
+            continue
+        elif isinstance(line[0], WDL.Expr.Placeholder):
+            # TODO: How can we convert MiniWDL's column numbers into space/tab counts or sequences?
+            #
+            # For now just skip these too.
+            continue
+        else:
+            # The line starts with a string
+            assert isinstance(line[0], str)
+            if len(line[0]) == 0:
+                # Still totally empty though!
+                if not tolerate_blanks:
+                    # There's no leading whitespace here!
+                    common_whitespace_prefix = ""
+                continue
+            if len(line) == 1 and tolerate_all_whitespace and all(x in (' ', '\t') for x in line[0]):
+                # All-whitespace lines shouldn't count
+                continue
+            # TODO: There are good algorithms for common prefixes. This is a bad one.
+            # Find the number of leading whitespace characters
+            line_whitespace_end = 0
+            while line_whitespace_end < len(line[0]) and line[0][line_whitespace_end] in (' ', '\t'):
+                line_whitespace_end += 1
+            # Find the string of leading whitespace characters
+            line_whitespace_prefix = line[0][:line_whitespace_end]
+
+            if ' ' in line_whitespace_prefix and '\t' in line_whitespace_prefix:
+                # Warn and don't change anything if spaces and tabs are mixed, per the spec.
+                logger.warning("Line in command at %s mixes leading spaces and tabs! Not removing leading whitespace!", expression.pos)
+                return expression
+
+            if common_whitespace_prefix is None:
+                # This is the first line we found, so it automatically has the common prefic
+                common_whitespace_prefix = line_whitespace_prefix
+            elif not tolerate_dedents:
+                # Trim the common prefix down to what we have for this line
+                if not line_whitespace_prefix.startswith(common_whitespace_prefix):
+                    # Shorten to the real shared prefix.
+                    # Hackily make os.path do it for us,
+                    # character-by-character. See
+                    # <https://stackoverflow.com/a/6718435>
+                    common_whitespace_prefix = os.path.commonprefix([common_whitespace_prefix, line_whitespace_prefix])
+
+    if common_whitespace_prefix is None:
+        common_whitespace_prefix = ""
+    
+    if debug:
+        logger.debug("Common Prefix: '%s'", common_whitespace_prefix)
+
+    # Then we trim that much whitespace off all the leading strings.
+    # We tolerate the common prefix not *actually* being common and remove as
+    # much of it as is there, to support tolerate_dedents.
+
+    def first_mismatch(prefix: str, value: str) -> int:
+        """
+        Get the index of the first character in value that does not match the corresponding character in prefix, or the length of the shorter string.
+        """
+        for n, (c1, c2) in enumerate(zip(prefix, value)):
+            if c1 != c2:
+                return n
+        return min(len(prefix), len(value))
+    
+    # Trim up to the first mismatch vs. the common prefix if the line starts with a string literal.
+    stripped_lines = [
+        (
+            (
+                cast(
+                    List[Union[str, WDL.Expr.Placeholder]],
+                    [line[0][first_mismatch(common_whitespace_prefix, line[0]):]]
+                ) + line[1:]
+            )
+            if len(line) > 0 and isinstance(line[0], str) else
+            line
+        )
+        for line in lines
+    ]
+    if debug:
+        logger.debug("Stripped Lines: %s", stripped_lines)
+
+    # Then we reassemble the parts and make a new expression.
+    # Build lists and turn the lists into strings later
+    new_parts: List[Union[List[str], WDL.Expr.Placeholder]] = []
+    for i, line in enumerate(stripped_lines):
+        if i > 0:
+            # This is a second line, so we need to tack on a newline.
+            if len(new_parts) > 0 and isinstance(new_parts[-1], list):
+                # Tack on to existing string collection
+                new_parts[-1].append("\n")
+            else:
+                # Make a new string collection
+                new_parts.append(["\n"])
+        if len(line) > 0 and isinstance(line[0], str) and i > 0:
+            # Line starts with a string we need to merge with the last string.
+            # We know the previous line now ends with a string collection, so tack it on.
+            assert isinstance(new_parts[-1], list)
+            new_parts[-1].append(line[0])
+            # Make all the strings into string collections in the rest of the line
+            new_parts += [([x] if isinstance(x, str) else x) for x in line[1:]]
+        else:
+            # No string merge necessary
+            # Make all the strings into string collections in the whole line
+            new_parts += [([x] if isinstance(x, str) else x) for x in line]
+
+    if debug:
+        logger.debug("New Parts: %s", new_parts)
+
+    # Now go back to the alternating strings and placeholders that MiniWDL wants
+    new_parts_merged: List[Union[str, WDL.Expr.Placeholder]] = [("".join(x) if isinstance(x, list) else x) for x in new_parts]
+
+    if debug:
+        logger.debug("New Parts Merged: %s", new_parts_merged)
+        
+    modified = WDL.Expr.String(expression.pos, new_parts_merged, expression.command)
+    # Fake the type checking of the modified expression.
+    # TODO: Make MiniWDL expose a real way to do this?
+    modified._type = expression._type
+    return modified
 
 
 def potential_absolute_uris(uri: str, path: List[str], importer: Optional[WDL.Tree.Document] = None) -> Iterator[str]:
@@ -1579,7 +1759,9 @@ class WDLTaskWrapperJob(WDLBaseJob):
             total_bytes: float = convert_units(total_gb, 'GB')
             runtime_disk = int(total_bytes)
 
-        if runtime_bindings.has_binding('gpuType') or runtime_bindings.has_binding('gpuCount') or runtime_bindings.has_binding('nvidiaDriverVersion'):
+        # The gpu field is the WDL 1.1 standard, so this field will be the absolute truth on whether to use GPUs or not
+        # Fields such as gpuType and gpuCount will be considered optional attributes
+        if runtime_bindings.get('gpu') is True:
             # We want to have GPUs
             # TODO: actually coerce types here instead of casting to detect user mistakes
             # Get the GPU count if set, or 1 if not,
@@ -1937,15 +2119,24 @@ class WDLTaskJob(WDLBaseJob):
 
                     extra_flags: Set[str] = set()
                     accelerators_needed: Optional[List[AcceleratorRequirement]] = self.accelerators
+                    local_accelerators = get_individual_local_accelerators()
                     if accelerators_needed is not None:
                         for accelerator in accelerators_needed:
+                            # This logic will not work if a workflow needs to specify multiple GPUs of different types
+                            # Right now this assumes all GPUs on the node are the same; we only look at the first available GPU
+                            # and assume homogeneity
+                            # This shouldn't cause issues unless a user has a very odd machine setup, which should be rare
                             if accelerator['kind'] == 'gpu':
-                                if accelerator['brand'] == 'nvidia':
+                                # Grab detected GPUs
+                                local_gpus: List[Optional[str]] = [accel['brand'] for accel in local_accelerators if accel['kind'] == 'gpu'] or [None]
+                                # Tell singularity the GPU type
+                                gpu_brand = accelerator.get('brand') or local_gpus[0]
+                                if gpu_brand == 'nvidia':
                                     # Tell Singularity to expose nvidia GPUs
                                     extra_flags.add('--nv')
-                                elif accelerator['api'] == 'rocm':
+                                elif gpu_brand == 'amd':
                                     # Tell Singularity to expose ROCm GPUs
-                                    extra_flags.add('--nv')
+                                    extra_flags.add('--rocm')
                                 else:
                                     raise RuntimeError('Cannot expose allocated accelerator %s to Singularity job', accelerator)
 
@@ -1978,42 +2169,8 @@ class WDLTaskJob(WDLBaseJob):
             # Make a new standard library for evaluating the command specifically, which only deals with in-container paths and out-of-container paths.
             command_library = ToilWDLStdLibTaskCommand(file_store, task_container)
 
-            def hacky_dedent(text: str) -> str:
-                """
-                Guess what result we would have gotten if we dedented the
-                command before substituting placeholder expressions, given the
-                command after substituting placeholder expressions. Workaround
-                for mimicking MiniWDL making us also suffer from
-                <https://github.com/chanzuckerberg/miniwdl/issues/674>.
-                """
-
-                # First just run MiniWDL's dedent
-                # Work around wrong types from MiniWDL. See <https://github.com/chanzuckerberg/miniwdl/issues/665>
-                dedent = cast(Callable[[str], Tuple[int, str]], strip_leading_whitespace)
-
-                text = dedent(text)[1]
-
-                # But this can still leave dedenting to do. Find the first
-                # not-all-whitespace line and get its leading whitespace.
-                to_strip: Optional[str] = None
-                for line in text.split("\n"):
-                    if len(line.strip()) > 0:
-                        # This is the first not-all-whitespace line.
-                        # Drop the leading whitespace.
-                        rest = line.lstrip()
-                        # Grab the part that gets removed by lstrip
-                        to_strip = line[0:(len(line) - len(rest))]
-                        break
-                if to_strip is None or len(to_strip) == 0:
-                    # Nothing to cut
-                    return text
-
-                # Cut to_strip off each line that it appears at the start of.
-                return "\n".join((line.removeprefix(to_strip) for line in text.split("\n")))
-
-
             # Work out the command string, and unwrap it
-            command_string: str = hacky_dedent(evaluate_named_expression(self._task, "command", WDL.Type.String(), self._task.command, contained_bindings, command_library).coerce(WDL.Type.String()).value)
+            command_string: str = evaluate_named_expression(self._task, "command", WDL.Type.String(), remove_common_leading_whitespace(self._task.command), contained_bindings, command_library).coerce(WDL.Type.String()).value
 
             # Do any command injection we might need to do
             command_string = self.add_injections(command_string, task_container)
@@ -2999,15 +3156,14 @@ class WDLRootJob(WDLSectionJob):
     the workflow name; both forms are accepted.
     """
 
-    def __init__(self, workflow: WDL.Tree.Workflow, inputs: WDLBindings, wdl_options: Optional[Dict[str, str]] = None, **kwargs: Any) -> None:
+    def __init__(self, target: Union[WDL.Tree.Workflow, WDL.Tree.Task], inputs: WDLBindings, wdl_options: Optional[Dict[str, str]] = None, **kwargs: Any) -> None:
         """
         Create a subtree to run the workflow and namespace the outputs.
         """
 
         # The root workflow names the root namespace and task path.
-        super().__init__(workflow.name, workflow.name, wdl_options=wdl_options, **kwargs)
-
-        self._workflow = workflow
+        super().__init__(target.name, target.name, wdl_options=wdl_options, **kwargs)
+        self._target = target
         self._inputs = inputs
 
     @report_wdl_errors("run root job")
@@ -3016,14 +3172,19 @@ class WDLRootJob(WDLSectionJob):
         Actually build the subgraph.
         """
         super().run(file_store)
+        if isinstance(self._target, WDL.Tree.Workflow):
+            # Create a workflow job. We rely in this to handle entering the input
+            # namespace if needed, or handling free-floating inputs.
+            job: WDLBaseJob = WDLWorkflowJob(self._target, [self._inputs], [self._target.name], self._namespace, self._task_path, wdl_options=self._wdl_options)
+        else:
+            # There is no workflow. Create a task job.
+            job = WDLTaskWrapperJob(self._target, [], [self._target.name], self._namespace, self._task_path, wdl_options=self._wdl_options)
+        # Run the task or workflow
+        job.then_namespace(self._namespace)
+        self.addChild(job)
+        self.defer_postprocessing(job)
+        return job.rv()
 
-        # Run the workflow. We rely in this to handle entering the input
-        # namespace if needed, or handling free-floating inputs.
-        workflow_job = WDLWorkflowJob(self._workflow, [self._inputs], [self._workflow.name], self._namespace, self._task_path, wdl_options=self._wdl_options)
-        workflow_job.then_namespace(self._namespace)
-        self.addChild(workflow_job)
-        self.defer_postprocessing(workflow_job)
-        return workflow_job.rv()
 
 @contextmanager
 def monkeypatch_coerce(standard_library: ToilWDLStdLibBase) -> Generator[None, None, None]:
@@ -3091,11 +3252,16 @@ def main() -> None:
             # Load the WDL document
             document: WDL.Tree.Document = WDL.load(options.wdl_uri, read_source=toil_read_source)
 
-            if document.workflow is None:
-                # Complain that we need a workflow.
-                # We need the absolute path or URL to raise the error
-                wdl_abspath = options.wdl_uri if not os.path.exists(options.wdl_uri) else os.path.abspath(options.wdl_uri)
-                raise WDL.Error.ValidationError(WDL.Error.SourcePosition(options.wdl_uri, wdl_abspath, 0, 0, 0, 1), "No workflow found in document")
+            # See if we're going to run a workflow or a task
+            target: Union[WDL.Tree.Workflow, WDL.Tree.Task]
+            if document.workflow:
+                target = document.workflow
+            elif len(document.tasks) == 1:
+                target = document.tasks[0]
+            elif len(document.tasks) > 1:
+                raise WDL.Error.InputError("Multiple tasks found with no workflow! Either add a workflow or keep one task.")
+            else:
+                raise WDL.Error.InputError("WDL document is empty!")
 
             if options.inputs_uri:
                 # Load the inputs. Use the same loading mechanism, which means we
@@ -3120,9 +3286,9 @@ def main() -> None:
             WDLTypeDeclBindings = WDL.Env.Bindings[Union[WDL.Tree.Decl, WDL.Type.Base]]
             input_bindings = WDL.values_from_json(
                 inputs,
-                cast(WDLTypeDeclBindings, document.workflow.available_inputs),
-                cast(Optional[WDLTypeDeclBindings], document.workflow.required_inputs),
-                document.workflow.name
+                cast(WDLTypeDeclBindings, target.available_inputs),
+                cast(Optional[WDLTypeDeclBindings], target.required_inputs),
+                target.name
             )
 
             # Determine where to look for files referenced in the inputs, in addition to here.
@@ -3152,7 +3318,7 @@ def main() -> None:
             assert wdl_options.get("container") is not None
 
             # Run the workflow and get its outputs namespaced with the workflow name.
-            root_job = WDLRootJob(document.workflow, input_bindings, wdl_options=wdl_options)
+            root_job = WDLRootJob(target, input_bindings, wdl_options=wdl_options)
             output_bindings = toil.start(root_job)
         if not isinstance(output_bindings, WDL.Env.Bindings):
             raise RuntimeError("The output of the WDL job is not a binding.")

@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import string
 import subprocess
 import unittest
 from uuid import uuid4
@@ -13,8 +14,10 @@ from typing import Any, Dict, List, Set
 import logging
 import pytest
 
+from toil.fileStores import FileID
 from toil.provisioners import cluster_factory
 from toil.test import (ToilTest,
+                       needs_docker,
                        needs_docker_cuda,
                        needs_google_storage,
                        needs_singularity_or_docker,
@@ -43,7 +46,16 @@ class BaseWDLTest(ToilTest):
 
 
 WDL_CONFORMANCE_TEST_REPO = "https://github.com/DataBiosphere/wdl-conformance-tests.git"
-WDL_CONFORMANCE_TEST_COMMIT = "b2b4bf952785a9b69724880793ff0d9e41df6309"
+WDL_CONFORMANCE_TEST_COMMIT = "01401a46bc0e60240fb2b69af4b978d0a5bd8fc8"
+# These tests are known to require things not implemented by
+# Toil and will not be run in CI.
+WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL= [
+    16, # Basic object test (deprecated and removed in 1.1); MiniWDL and toil-wdl-runner do not support Objects, so this will fail if ran by them
+    21, # Parser: expression placeholders in strings in conditional expressions in 1.0, Cromwell style; Fails with MiniWDL and toil-wdl-runner
+    64, # Legacy test for as_map_as_input; It looks like MiniWDL does not have the function as_map()
+    72, # Symlink passthrough; see <https://github.com/DataBiosphere/toil/issues/5031>
+    77, # Test that array cannot coerce to a string. WDL 1.1 does not allow compound types to coerce into a string. This should return a TypeError.
+]
 
 class WDLConformanceTests(BaseWDLTest):
     """
@@ -79,26 +91,32 @@ class WDLConformanceTests(BaseWDLTest):
 
         p.check_returncode()
 
-    # estimated running time: 2 minutes
+    # estimated running time: 10 minutes
     @slow
     def test_conformance_tests_v10(self):
-        tests_to_run = "0-15,17-20,22-71,73-78"
-        p = subprocess.run(self.base_command + ["-v", "1.0", "-n", tests_to_run], capture_output=True)
+        command = self.base_command + ["-v", "1.0"]
+        if WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL:
+            command.append("--exclude-numbers")
+            command.append(",".join([str(t) for t in WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL]))
+        p = subprocess.run(command, capture_output=True)
 
         self.check(p)
 
-    # estimated running time: 2 minutes
+    # estimated running time: 10 minutes
     @slow
     def test_conformance_tests_v11(self):
-        tests_to_run = "1-63,65-71,73-76,78"
-        p = subprocess.run(self.base_command + ["-v", "1.1", "-n", tests_to_run], capture_output=True)
+        command = self.base_command + ["-v", "1.1"]
+        if WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL:
+            command.append("--exclude-numbers")
+            command.append(",".join([str(t) for t in WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL]))
+        p = subprocess.run(command, capture_output=True)
 
         self.check(p)
 
     @slow
     def test_conformance_tests_integration(self):
         ids_to_run = "encode,tut01,tut02,tut03,tut04"
-        p = subprocess.run(self.base_command + ["-v", "1.0", "--id", ids_to_run], capture_output=True)
+        p = subprocess.run(self.base_command + ["-v", "1.0", "--conformance-file", "integration.yaml", "--id", ids_to_run], capture_output=True)
 
         self.check(p)
 
@@ -135,6 +153,73 @@ class WDLTests(BaseWDLTest):
         assert os.path.exists(result['ga4ghMd5.value'])
         assert os.path.basename(result['ga4ghMd5.value']) == 'md5sum.txt'
 
+    def test_url_to_file(self):
+        """
+        Test if web URL strings can be coerced to usable Files.
+        """
+        wdl = os.path.abspath('src/toil/test/wdl/testfiles/url_to_file.wdl')
+
+        result_json = subprocess.check_output(
+            self.base_command + [wdl, '-o', self.output_dir, '--logInfo', '--retryCount=0'])
+        result = json.loads(result_json)
+
+        assert 'url_to_file.first_line' in result
+        assert isinstance(result['url_to_file.first_line'], str)
+        self.assertEqual(result['url_to_file.first_line'], 'chr1\t248387328')
+    
+    @needs_docker
+    def test_wait(self):
+        """
+        Test if Bash "wait" works in WDL scripts.
+        """
+        wdl = os.path.abspath('src/toil/test/wdl/testfiles/wait.wdl')
+
+        result_json = subprocess.check_output(
+            self.base_command + [wdl, '-o', self.output_dir, '--logInfo', '--retryCount=0', '--wdlContainer=docker'])
+        result = json.loads(result_json)
+
+        assert 'wait.result' in result
+        assert isinstance(result['wait.result'], str)
+        self.assertEqual(result['wait.result'], 'waited')
+
+    def test_url_to_optional_file(self):
+        """
+        Test if missing and error-producing URLs are handled correctly for optional File? values.
+        """
+        wdl = os.path.abspath('src/toil/test/wdl/testfiles/url_to_optional_file.wdl')
+
+        def run_for_code(code: int) -> dict:
+            """
+            Run a workflow coercing URL to File? where the URL returns the given status code.
+
+            Return the parsed output.
+            """
+            logger.info("Test optional file with HTTP code %s", code)
+            json_value = '{"url_to_optional_file.http_code": %d}' % code
+            result_json = subprocess.check_output(
+                self.base_command + [wdl, json_value, '-o', self.output_dir, '--logInfo', '--retryCount=0'])
+            result = json.loads(result_json)
+            return result
+
+        # Check files that exist
+        result = run_for_code(200)
+        assert 'url_to_optional_file.out_file' in result
+        self.assertNotEqual(result['url_to_optional_file.out_file'], None)
+
+        for code in (404, 410):
+            # Check files that definitely don't
+            result = run_for_code(code)
+            assert 'url_to_optional_file.out_file' in result
+            self.assertEqual(result['url_to_optional_file.out_file'], None)
+
+        for code in (402, 418, 500, 502):
+            # Check that cases where the server refuses to say if the file
+            # exists stop the workflow.
+            with self.assertRaises(subprocess.CalledProcessError):
+                run_for_code(code)
+
+
+
     def test_missing_output_directory(self):
         """
         Test if Toil can run a WDL workflow into a new directory.
@@ -169,8 +254,22 @@ class WDLTests(BaseWDLTest):
         assert len(outputs['hello_caller.message_files']) == 2
         for item in outputs['hello_caller.message_files']:
             # All the files should be strings in the "out" directory
-            assert isinstance(item, str)
-            assert item.startswith(out_dir)
+            assert isinstance(item, str), "File output must be a string"
+            assert item.startswith(out_dir), "File output must be in the output directory"
+
+            # Look at the filename within that directory
+            name_in_out_dir = item[len(out_dir):]
+
+            # Ity should contain the job name of "hello", so they are human-readable.
+            assert "hello" in name_in_out_dir, f"File output {name_in_out_dir} should have the originating task name in it"
+
+            # And it should not contain non-human-readable content.
+            #
+            # We use a threshold number of digits as a proxy for this, but
+            # don't try and get around this by just rolling other random
+            # strings; we want these outputs to be human-readable!!!
+            digit_count = len([c for c in name_in_out_dir if c in string.digits])
+            assert digit_count < 3, f"File output {name_in_out_dir} has {digit_count} digits, which is too many to be plausibly human-readable"
 
         assert 'hello_caller.messages' in outputs
         assert outputs['hello_caller.messages'] == ["Hello, Alyssa P. Hacker!", "Hello, Ben Bitdiddle!"]
@@ -506,6 +605,60 @@ class WDLToilBenchTests(ToilTest):
         trimmed = remove_common_leading_whitespace(expr)
         assert trimmed.command == True
 
+    def test_choose_human_readable_directory(self):
+        """
+        Test to make sure that we pick sensible but non-colliding directories to put files in.
+        """
+
+        from toil.wdl.wdltoil import choose_human_readable_directory, DirectoryNamingStateDict
+
+        state: DirectoryNamingStateDict = {}
+
+        # The first time we should get  apath with the task name and without the ID
+        first_chosen = choose_human_readable_directory("root", "taskname", "111-222-333", state)
+        assert first_chosen.startswith("root")
+        assert "taskname" in first_chosen
+        assert "111-222-333" not in first_chosen
+
+        # If we use the same ID we should get the same result
+        same_id = choose_human_readable_directory("root", "taskname", "111-222-333", state)
+        self.assertEqual(same_id, first_chosen)
+
+        # If we use a different ID we shoudl get a different result still obeying the constraints
+        diff_id = choose_human_readable_directory("root", "taskname", "222-333-444", state)
+        self.assertNotEqual(diff_id, first_chosen)
+        assert diff_id.startswith("root")
+        assert "taskname" in diff_id
+        assert "222-333-444" not in diff_id
+
+    def test_uri_packing(self):
+        """
+        Test to make sure Toil URI packing brings through the required information.
+        """
+
+        from toil.wdl.wdltoil import pack_toil_uri, unpack_toil_uri
+
+        # Set up a file
+        file_id = FileID("fileXYZ", 123, True)
+        task_path = "the_wf.the_task"
+        dir_id = uuid4()
+        file_basename = "thefile.txt"
+
+        # Pack and unpack it
+        uri = pack_toil_uri(file_id, task_path, dir_id, file_basename)
+        unpacked = unpack_toil_uri(uri)
+
+        # Make sure we got what we put in
+        self.assertEqual(unpacked[0], file_id)
+        self.assertEqual(unpacked[0].size, file_id.size)
+        self.assertEqual(unpacked[0].executable, file_id.executable)
+
+        self.assertEqual(unpacked[1], task_path)
+
+        # TODO: We don't make the UUIDs back into UUID objects
+        self.assertEqual(unpacked[2], str(dir_id))
+
+        self.assertEqual(unpacked[3], file_basename)
 
 
 

@@ -199,6 +199,10 @@ levels in toil are based on priority from the logging module:
                         'h_vmem=MEMORY' to the qsub call, and instead rely on
                         TOIL_GRIDGENGINE_ARGS to supply alternative arguments.
                         Requires that TOIL_GRIDGENGINE_ARGS be set.
+  --memoryIsProduct
+                        If the batch system understands requested memory as a product of the requested
+                        memory and the number of cores, set this flag to properly allocate memory. This
+                        can be fairly common with grid engine clusters (Ex: SGE, PBS, Torque).
   --runCwlInternalJobsOnWorkers
                         Whether to run CWL internal jobs (e.g. CWLScatter) on
                         the worker nodes instead of the primary node. If false
@@ -286,6 +290,13 @@ Allows configuring Toil's data storage.
                         to use a batch system that does not support
                         cleanup. Set to "true" if caching
                         is desired.
+  --symlinkJobStoreReads BOOL
+                        Allow reads and container mounts from a JobStore's
+                        shared filesystem directly via symlink. Can be turned
+                        off if the shared filesystem can't support the IO load
+                        of all the jobs reading from it at once, and you want
+                        to use ``--caching=True`` to make jobs on each node
+                        read from node-local cache storage. (Default=True)
 
 **Autoscaling Options**
 Allows the specification of the minimum and maximum number of nodes in an
